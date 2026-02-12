@@ -2,4 +2,4 @@ This directory contains the Matlab script used to simulate surface nitrate drawd
 Author: Britton Dempsey
 Email: brittondempsey@dal.ca
 
-The optimized parameters used to produce model outputs discussed in the associated manuscript are listed in the .xcl
+The optimized parameters used to produce model outputs discussed in the associated manuscript are listed in the .csv files. 
