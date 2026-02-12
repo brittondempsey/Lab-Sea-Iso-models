@@ -1,0 +1,469 @@
+close all
+clear
+
+%% Set time domain of 1-box reaction model
+
+days = 50; %approximate number of days from 2022 Lab sea bloom initiation to sampling period from BIO satellite observations
+T = 10000;%number of time steps
+
+dt = days/T; %time interval (d)
+dz = 1; %depth interval (m)
+Z = 162;%number boxes (including z= 1 and z= 102 boundary boxes)
+z = 160;%boxes in depth domain
+
+%% Advection and diffusion 
+
+kap = 19; % diffusion coefficient (m^2/d)
+D = kap*ones(Z,1);
+r = kap*dt/dz^2; % Stability condition <1/2
+
+%kappa initialization by defining half grid points
+k = NaN(1,Z+1); % kappa at half grid points
+k(2:end-1) = 0.5*(D(2:end)+D(1:end-1));
+k(1) = D(1); % at i = 1/2
+k(end) = D(end); % at i= N+1/2
+
+%% Define rate profiles
+
+%Nitrate uptake (NAA) specific rate profile (day^-1) 
+ix = (1:z);
+NAA = 0.063; % Profile max
+NAA_min1 = 0.00;
+NAA_min2 = 0.00;
+width = 25;%29.94; %Optimized by fitting to CE22 NO3 drawdown at a kNAA =0.06 in a closed system (no regeneration)
+ain_NAA = [NAA-NAA_min1 0 width NAA_min1];%[max_rate dep_max width min_rate]
+kNAA = normalfunc(ix,ain_NAA)'; %call normal distribution function
+kNAA =[max(kNAA);kNAA;min(kNAA)];
+
+reg_NAA = 0.145; % Sets REG_NO3 rate as a fraction of NAA 
+N_fix = 0; % Set N-fix rate
+
+%% Define initial d15/d18 NO3 source values and isotope effects
+
+%standard ratios of reference materials for conversions
+R15std=0.00367647; %air
+R18std=0.00200517; %VMSOW
+
+%average 15N and 18O of subsurface samples from Deman et al. 2021
+avr_d15NO3_deep = 4.87;% o/oo
+avr_d18NO3_deep = 2.5;% o/oo
+
+% set fractional abundances of H2O and O2
+d18OH2O=0.18;% (o/oo) Reflects pure atlantic water source 0.18 permil (Benetti et al., 2016)
+d18OO2=23.5;% (o/oo)
+Rh2o18=((d18OH2O/1000)+1)*R18std;
+Ro218=((d18OO2/1000)+1)*R18std;
+Fh2o18 = Rh2o18/(1+Rh2o18);
+Fo218 = Ro218/(1+Ro218);
+Fh2o16 = 1-Fh2o18;
+Fo216 = 1-Fo218;
+
+% set fractional abundance of air
+d15N_air=0;
+R15N_air=((d15N_air/1000)+1)*R15std;
+F_air15 = R15N_air/(1+R15N_air);
+F_air14 = 1-F_air15;
+
+% Set isotope effect values for processes
+epsilon15NAA= 3.6; %d15N nitrate uptake isotope effect
+epsilon18NAA= epsilon15NAA; %d18O nitrate isotope effect
+epsilon15REG= 2; %d15N NO3 regeneration isotope effect (PN to NO3)
+epsilon18h2o=14; %Isotope effect for H20 d18O incorporation
+epsilon18O2=14; %Isotope effect for O2 d18O incorporation
+
+%convert isotope effects to alpha values
+alpha15NAA=epsilon15NAA/1000+1;
+alpha18NAA=epsilon18NAA/1000+1;
+alpha15REG=epsilon15REG/1000+1;
+alpha18h2o=epsilon18h2o/1000+1;
+alpha18O2=epsilon18O2/1000+1;
+
+%% Define initial NO3 and PN profiles (Concentration and Isotopes)
+
+%set initial NO3 conc. Set NO3_min1 and NO3_min2 equal to NO3_max for a
+%vertical profile with no gradient. Initialize as a varying profile otherwise by playing
+%with the values
+ix = (1:Z);
+NO3_max = 13.75; % Constrained using Prebloom (MAR and APR) WOA monthly climatology
+NO3_min1 = 13.75;
+NO3_min2 = 13.75;
+ain_NO3 = [NO3_max-NO3_min1 100 35 NO3_min1];
+NO3 = normalfunc(ix,ain_NO3)';
+NO3 = [NO3(1:Z-2)];
+
+%initialize conc and iso it=1 profiles
+% R = isotope ratios
+% F = fractional abundances
+%x14 and x15 (14N-NO3 and 15N-NO3)
+x140= NO3;
+dx150= avr_d15NO3_deep - epsilon15NAA*(log(x140/NO3_max));
+R15x  =((dx150/1000)+1)*R15std;
+x150= NO3.*R15x;
+
+%x16 and x18 (16O-NO3 and 18O-NO3)
+x160= 3*NO3;
+dx180= avr_d18NO3_deep - epsilon18NAA*(log(x160./(3*NO3_max)));
+R18x  =((dx180/1000)+1)*R18std;
+x180= x160.*R18x;
+
+%PN14 and PN15 (14N-PN and 15N-PN)
+PN_max = 0.01; % Starting PN conc value
+PN140 = PN_max*ones(z,1); 
+dpn150= avr_d15NO3_deep - epsilon15NAA;
+R15pn  =((dpn150/1000)+1)*R15std;
+PN150 = PN140*R15pn;
+
+%% Find indices of data that we are fitting to
+
+% load in data that will be used to fit the model to
+dat = readtable('LabSea2022_NO3_drawdown_dat.xlsx'); %NO3 drawdown data
+d15NO3_dat = readtable('CE22_d15N_sulfamic_dat.xlsx'); %Contains d15NO3 data with sulfamic treatment
+
+CE_stn = [4;6;8;9;11;12];% E1 stations of the CE22009 survey drid
+
+dep = (1:1:Z-2); %depth vector
+
+% find indices of 'Early' NO3 concentration samples
+ind_e1 = cell(length(CE_stn),1);
+for i=1:length(CE_stn)
+    ind_e1{i,1} = find(dat.Station == CE_stn(i)); %E1 data
+end
+
+% % find indices of d15N and d18O samples in subsurface (100 - 250m)
+ind_s = cell(length(CE_stn),1);
+for i=1:length(CE_stn)
+    ind_s{i,1} = find(dat.Station == CE_stn(i) & dat.DEPTH <=100);% surface interval
+end
+
+%Place indices in vector
+ind_e1 = cell2mat(ind_e1);
+ind_s = cell2mat(ind_s);
+
+%% Set boundary conditions for model grid @ iT = 1; iZ=1 and iZ=102
+
+x14= nan(Z,T);
+x14(2:end-1,1)= x140;
+x14(1,:)= x140(1);
+x14(end,:)= x140(end);
+x15 = nan(Z,T);
+x15(2:end-1,1) = x150;
+x15(1,:)= x150(1);
+x15(end,:)= x150(end);
+
+x16= nan(Z,T);
+x16(2:end-1,1)= x160;
+x16(1,:)= x160(1);
+x16(end,:)= x160(end);
+x18 = nan(Z,T);
+x18(2:end-1,1) = x180;
+x18(1,:)= x180(1);
+x18(end,:)= x180(end);
+
+PN14= nan(Z,T);
+PN14(2:end-1,1)= PN140;
+PN14(1,:)= PN140(1);
+PN14(end,:)= PN140(end);
+
+PN15= nan(Z,T);
+PN15(2:end-1,1)= PN150;
+PN15(1,:)= PN150(1);
+PN15(end,:)= PN150(end);
+
+FPN14_int = nan(1,T);
+FPN15_int = nan(1,T);
+
+PN14_int = nan(1,T);
+PN15_int = nan(1,T);
+
+diff_flx = nan(1,T);
+new_prod_flx = nan(1,T);
+no3_reg_flx = nan(1,T);
+resup = nan(1,T);
+resup(1) = 0;
+new_prod = nan(1,T);
+new_prod(1) = 0;
+no3_reg = nan(1,T);
+no3_reg(1) = 0;
+
+f_no3 = nan(1,T);
+PN_int = nan(1,T);
+dpn15_int = nan(1,T);
+REG = nan(1,T);
+
+%%
+
+for iT = 1:T-1
+    %iterate over subsurface bins (below 90m)
+    
+    for iZ = 2:Z-1
+        
+        % Rayleigh equations to calculate integrated isotopic signatures above 100m
+        f_no3(iT) = sum(x14(2:end-1,iT)+x15(2:end-1,iT))/(sum(x14(2:end-1,1)+x15(2:end-1,1))+0.01); % Integrated fraction of NO3 remianing above 100 m % +0.01 in denominator to avoid nan when calculation dpn15_int in the next line
+        dpn15_int(iT) = avr_d15NO3_deep+epsilon15NAA.*f_no3(iT).*log(f_no3(iT))./(1-f_no3(iT)); % Integrated d15NPN
+        REG(iT) = (sum(kNAA(:).*(x14(:,iT)+x15(:,iT))).*reg_NAA)./100; % Track the rate of REG-NO3
+
+        PN_int(iT) = sum(PN14(2:end-1,iT)+PN15(2:end-1,iT))/z;
+        PN14_int(iT) = sum(PN14(2:end-1,iT))/z;
+        PN15_int(iT) = sum(PN15(2:end-1,iT))/z;
+        FPN15_int(iT) = PN15_int(iT)/(PN14_int(iT)+PN15_int(iT));
+        FPN14_int(iT) = PN14_int(iT)/(PN14_int(iT)+PN15_int(iT));
+     
+        % Set surface wall boundary conditions for no3
+        x14(1,iT)  = x14(2, iT);
+        x15(1,iT)  = x15(2, iT);
+        x16(1,iT)  = x16(2, iT);
+        x18(1,iT)  = x18(2, iT);
+
+        % Calculate NO3 diffusive flux entering model domain every step
+        diff_flx(iT) = dt*(kap*((x14(Z,iT)+x15(102,iT))-(x14(end-1,iT)+x15(101,iT)))./dz); %diffusive flux of NO3 into upper 100m 
+        new_prod_flx(iT) = dt*sum(kNAA(2:end-1).*(x14(2:end-1,iT)+x15(2:end-1,iT)));
+        no3_reg_flx(iT) = dt*REG(iT)*100;
+
+        % calculate total NO3 diffusive resupply over the simulation
+        resup(iT+1) = resup(iT)+diff_flx(iT);
+        new_prod(iT+1) = new_prod(iT)+new_prod_flx(iT);
+        no3_reg(iT+1) = no3_reg(iT)+no3_reg_flx(iT);
+
+%State variable equations
+%15N/14N nitrate
+
+        x14(iZ,iT+1) = x14(iZ,iT) + dt*( ...
+        (D(iZ+1)*x14(iZ+1,iT)-(D(iZ+1)+D(iZ-1))*x14(iZ,iT)+D(iZ-1)*x14(iZ-1,iT))/dz^2 ...
+        -kNAA(iZ)*x14(iZ,iT) ...
+        +REG(iT)*FPN14_int(iT));
+
+        x15(iZ,iT+1) = x15(iZ,iT) + dt*( ...
+        (D(iZ+1)*x15(iZ+1,iT)-(D(iZ+1)+D(iZ-1))*x15(iZ,iT)+D(iZ-1)*x15(iZ-1,iT))/dz^2 ...
+        -kNAA(iZ)/alpha15NAA*x15(iZ,iT) ...
+        +REG(iT)/alpha15REG*FPN15_int(iT));
+
+%18N/16N nitrate
+
+        x16(iZ,iT+1) = x16(iZ,iT) + dt*( ...
+        (D(iZ+1)*x16(iZ+1,iT)-(D(iZ+1)+D(iZ-1))*x16(iZ,iT)+D(iZ-1)*x16(iZ-1,iT))/dz^2 ...
+        -kNAA(iZ)*x16(iZ,iT) ...
+        +(1/3)*REG(iT)*(2*Fh2o16+Fo216));
+
+        x18(iZ,iT+1) = x18(iZ,iT) + dt*( ...
+        (D(iZ+1)*x18(iZ+1,iT)-(D(iZ+1)+D(iZ-1))*x18(iZ,iT)+D(iZ-1)*x18(iZ-1,iT))/dz^2 ...
+        -kNAA(iZ)/alpha18NAA*x18(iZ,iT) ...
+        +(1/3)*REG(iT)*(2*Fh2o18/alpha18h2o+Fo218/alpha18O2));
+
+%15N/14N PN
+
+        PN14(iZ,iT+1) = PN14(iZ,iT) + dt*( ...
+        +kNAA(iZ)*x14(iZ,iT) ...
+        -REG(iT)*FPN14_int(iT) ...
+        +N_fix*F_air14);
+
+        PN15(iZ,iT+1) = PN15(iZ,iT) + dt*( ...
+        +kNAA(iZ)/alpha15NAA*x15(iZ,iT) ...
+        -REG(iT)/alpha15REG*FPN15_int(iT) ...
+        +N_fix*F_air15);
+        
+
+    end
+
+end
+       
+
+% Calculate final modelled profiles
+dx15 = ((((x15(2:end-1,:)./x14(2:end-1,:))./R15std)-1)*1000);
+dx18 = ((((x18(2:end-1,:)./x16(2:end-1,:))./R18std)-1)*1000);
+dpn15 = ((((PN15(2:end-1,:)./PN14(2:end-1,:))./R15std)-1)*1000);
+no3 = x14(2:end-1,:)+x15(2:end-1,:);
+pn = PN14(2:end-1,:)+PN15(2:end-1,:);
+
+d15N_mass_dis = mean(((dx15.*no3) + (dpn15.*pn))./(no3+pn)); %average mass balance of 15N of total N over discrete depths in the model domain
+
+%% Plot progession of integrated NO3 and PN concentration and NAA and REG rates
+
+% f1 = figure;
+% f1.Position = [0 200 1500 400];
+% t1 = tiledlayout(1,3);
+% t1.TileSpacing = 'tight';
+% t1.Padding = 'loose';
+% nexttile % To check N conc mass balance
+%     hold on
+%     plot(1:T,sum(x14(2:end-1,:)+x15(2:end-1,:))+sum(PN14(2:end-1,:)+PN15(2:end-1,:)),'color',[0 0 0],'linewidth',2)
+%     plot(1:T,sum(x14(2:end-1,:)+x15(2:end-1,:)),'color','r','linewidth',2)
+%     plot(1:T,sum(PN14(2:end-1,:)+PN15(2:end-1,:)),'color', 'b','linewidth',2)
+%     xlabel('Time Step')
+%     ylabel('Inventory (mmol N m^{-2})')
+%     title('N Inventory above 100m')
+%     grid on 
+%     grid minor
+%     legend('total N','NO_3^-','PN','Location','eastoutside')
+%     set(gca,'fontsize',14)
+%     fontname(gcf,'Cambria')
+%     set(gcf,'color','w')
+%     set(gcf, 'InvertHardcopy', 'off');
+% nexttile % To check isotope mass balance
+%     hold on
+%     plot(1:T,d15N_mass_dis,'color',[0 0 0],'linewidth',2)
+%     plot(1:T,mean(dx15),'color','r','linewidth',2)
+%     % plot(1:T,mean(dpn15),'color', 'b','linewidth',2)
+%     ylim([0 12])
+%     xlabel('Time Step')
+%     ylabel(['\delta^1^5N (' char(8240) ')'])
+%     title('Total N 15N mass balance')
+%     grid on 
+%     grid minor
+%     legend('\delta^1^5N Fixed N','mean \delta^1^5N_{NO3}','mean \delta^1^5N_{PN}','Location','eastoutside')
+%     set(gca,'fontsize',14)
+%     fontname(gcf,'Cambria')
+%     set(gcf,'color','w')
+%     set(gcf, 'InvertHardcopy', 'off');
+% nexttile
+%     hold on
+%     plot(1:T,diff_flx,'color', 'k','linewidth',2)
+%     plot(1:T,new_prod_flx,'color','r','linewidth',2)
+%     plot(1:T,no3_reg_flx,'color', 'b','linewidth',2)
+%     xlabel('Time Step')
+%     ylabel('Flux (mmol N m^{-2} day^{-1})')
+%     title('Integrated fluxes')
+%     grid on 
+%     grid minor
+%     legend('NO_3^- Resupply','New production','NO_3^- Regeneration','Location','eastoutside')
+%     set(gca,'fontsize',14)
+%     fontname(gcf,'Cambria')
+%     set(gcf,'color','w')
+%     set(gcf, 'InvertHardcopy', 'off');
+% 
+%%
+
+%Rayliegh equations to calculate reference plots
+xf=0:0.01:1;
+d15N_sub =avr_d15NO3_deep-5*log(xf);
+d18N_sub =avr_d18NO3_deep-5*log(xf);
+d15N_accu = avr_d15NO3_deep+5.*xf.*log(xf)./(1-xf);
+
+f1 = figure;
+f1.Position = [0 50 1525 700];
+t1 = tiledlayout(4,4);
+t1.TileSpacing = 'tight';
+t1.Padding = 'tight';
+
+nexttile(1,[4 1])
+    hold on
+    scatter(dat.NO3(ind_e1),-dat.DEPTH(ind_e1),25,'o','filled','MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    plot(x14(3:end-1,1)+x15(3:end-1,1),-dep(2:end),':','color',[204 37 41]./260,'LineWidth',2)
+    plot(x14(3:end-1,end-1)+x15(3:end-1,end-1),-dep(2:end),'color',[204 37 41]./260,'LineWidth',2)
+    plot(PN14(3:end-1,1),-dep(2:end),':','color',[0 0 0],'LineWidth',2)
+    xline(PN_int(end-1),'color',[0 0 0],'LineWidth',2) % integrated PN profile
+    % plot(PN14(3:end-1,end-1),-dep(2:end),'color',[0.7 0.7 0.7],'LineWidth',2) % PN profile
+    ylabel('Depth (m)')
+    xlabel({'NO_3^- & PN (\muM)'})
+    xlim([-1 20])
+    ylim([-z 0])
+    set(gca,'XAxisLocation','top')
+    set(gca,'TickDir','out');
+    set(gca,'TickDir','out');
+    set(gca,'YMinorTick','on')
+    set(gca,'Color',[0.9 0.9 0.9])
+    set(gca, 'yticklabel', {'100','90','80','70','60','50','40','30','20','10','0'})
+    set(gca,'fontsize',14)
+    grid on
+    grid minor
+    legend('[NO3-] obs.','NO3-_i','NO3-_f','PN_i','PN_f','location','southwest','fontsize',10)
+    legend boxoff
+nexttile(2,[4 1])
+    hold on
+    scatter(dat.d15Nno3_avr(ind_e1),-dat.DEPTH(ind_e1),25,'o','filled','MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    scatter(dat.d18Ono3_avr(ind_e1),-dat.DEPTH(ind_e1),25,'o','filled','MarkerEdgeColor',[230 159 0]/230,'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    plot((((x15(3:end-1,1)./x14(3:end-1,1))./R15std)-1)*1000,-dep(2:end),':','color',[0 0.4470 0.7410],'LineWidth',2)
+    plot(dx15(2:end,end-1),-dep(2:end),'color',[0 0.4470 0.7410],'LineWidth',2)
+    plot((((x18(3:end-1,1)./x16(3:end-1,1))./R18std)-1)*1000,-dep(2:end),':','color',[230 159 0]/230,'LineWidth',2)
+    plot(dx18(2:end,end-1),-dep(2:end),'color',[230 159 0]/230,'LineWidth',2)
+    plot((((PN15(3:end-1,1)./PN14(3:end-1,1))./R15std)-1)*1000,-dep(2:end),':','color',[0 0 0],'LineWidth',2)
+    xline(dpn15_int(end-1),'color',[0 0 0],'LineWidth',2) 
+    % plot(dpn15(:,end-1),-dep,'color',[0.7 0.7 0.7],'LineWidth',2)
+    xlabel(['\delta^1^5N_{NO_{3}^{-}} & \delta^1^5N_{PN} (' char(8240) ')'],'FontSize',14)
+    xlim([-1 15])
+    ylim([-z 0])
+    set(gca,'XAxisLocation','top')
+    set(gca,'TickDir','out');
+    set(gca,'TickDir','out');
+    set(gca,'YMinorTick','on')
+    set(gca,'Color',[0.9 0.9 0.9])
+    set(gca, 'yticklabel', {'100','90','80','70','60','50','40','30','20','10','0'})
+    set(gca,'fontsize',14)
+    grid on
+    grid minor
+    legend('d15NO3- obs.','d18NO3- obs.','d15NO3-_i','d15NO3-_f','d18NO3_i','d18NO3_f','d15PN_i','d15PN_f','location','southeast','fontsize',10)
+    legend boxoff
+nexttile(3,[2 1])
+    hold on
+    scatter(log(dat.NO3(ind_s)/NO3_max),dat.d15Nno3_avr(ind_s),25,'o','filled','MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    plot(log(xf),d15N_sub,':','color',[0.7 0.7 0.7],'LineWidth',2)
+    plot(log(xf),d15N_accu,':','color',[0.7 0.7 0.7],'LineWidth',2)
+    plot(log((x14(3:end-1,end-1)+x15(3:end-1,end-1))./NO3_max),dx15(2:end,end-1),'color',[0 0.4470 0.7410],'LineWidth',2)
+    yline(avr_d15NO3_deep,'--','color',[0.7 0.7 0.7],'LineWidth',2)
+    xlim([-2.5 0])
+    ylim([-1 15])
+    ylabel(['\delta^1^5N_{NO_{3}^{-}} (' char(8240) ')'],'FontSize',14)
+    set(gca,'TickDir','out');
+    set(gca,'XMinorTick','on')
+    set(gca,'YMinorTick','on')
+    set(gca,'Color',[0.9 0.9 0.9])
+    set(gca,'XColor',[204 37 41]./260)
+    set(gca,'YColor',[0 0.4470 0.7410])
+    text(-2.5, 19.2,['^{15}{\epsilon} = 5 ' char(8240)],'FontSize',14,'Rotation',-29)
+    grid on
+    grid minor
+    set(gca,'GridColor',[0 0 0])
+    set(gca,'fontsize',14)
+    fontname(gcf,'Cambria')
+    set(gcf,'color','w')
+    set(gcf, 'InvertHardcopy', 'off');
+nexttile(11,[2 1])
+    hold on
+    scatter(log(dat.NO3(ind_s)/NO3_max),dat.d18Ono3_avr(ind_s),25,'o','filled','MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    plot(log(xf),d18N_sub,':','color',[0.7 0.7 0.7],'LineWidth',2)
+    plot(log((x14(3:end-1,end-1)+x15(3:end-1,end-1))./NO3_max),dx18(2:end,end-1),'color',[0 0.4470 0.7410],'LineWidth',2)
+    yline(avr_d18NO3_deep,'--','color',[0.7 0.7 0.7],'LineWidth',2)
+    xlim([-2.5 0])
+    ylim([-1 15])
+    xlabel('{\it ln}(NO_3^- remaining)','FontSize',14)
+    ylabel(['\delta^1^8O_{NO_{3}^{-}} (' char(8240) ')'],'FontSize',14)
+    set(gca,'TickDir','out');
+    set(gca,'XMinorTick','on')
+    set(gca,'YMinorTick','on')
+    set(gca,'Color',[0.9 0.9 0.9])
+    set(gca,'XColor',[204 37 41]./260)
+    set(gca,'YColor',[0 0.4470 0.7410])
+    text(-2, 13.5,['^{18}{\epsilon} = 5 ' char(8240)],'FontSize',14,'Rotation',-37)
+    grid on
+    grid minor
+    set(gca,'GridColor',[0 0 0])
+    set(gca,'fontsize',14)
+    fontname(gcf,'Cambria')
+    set(gcf,'color','w')
+    set(gcf, 'InvertHardcopy', 'off');    
+nexttile(4, [2 1])
+    hold on
+    X = 4:20;
+    Y = X + (avr_d18NO3_deep - avr_d15NO3_deep);
+    scatter(dat.d15Nno3_avr(ind_s),dat.d18Ono3_avr(ind_s),25,'o','filled','MarkerEdgeColor',[0 0 0],'MarkerFaceColor',[1 1 1],'LineWidth',2)
+    plot(X,Y,':','color',[0.7 0.7 0.7],'LineWidth',2)
+    plot(((((x15(3:101,end-1)./x14(3:101,end-1))./R15std)-1)*1000),((((x18(3:101,end-1)./x16(3:101,end-1))./R18std)-1)*1000),'color',[0 0 0],'LineWidth',2)
+    xlim([4 12])
+    ylim([0 10])
+    set(gca,'TickDir','out');
+    xlabel(['\delta^1^5N_{NO_{3}^{-}} (' char(8240) ')'],'FontSize',14)
+    ylabel(['\delta^1^8O_{NO_{3}^{-}} (' char(8240) ')'],'FontSize',14)
+    set(gca,'XMinorTick','on')
+    set(gca,'YMinorTick','on')
+    set(gca,'Color',[0.9 0.9 0.9])
+    grid on
+    grid minor
+    set(gca,'fontsize',14)
+    set(gca,'XColor',[0 0.4470 0.7410])
+    set(gca,'YColor',[0 0.4470 0.7410])
+    text(10.5, 7.5,'1:1','FontSize',14,'Rotation',37)
+    set(gca,'GridColor',[0 0 0])
+    fontname(gcf,'Cambria')
+    set(gcf,'color','w')
+    set(gcf, 'InvertHardcopy', 'off');
+
+
